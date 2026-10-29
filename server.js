@@ -1,102 +1,71 @@
 const express = require("express");
 const http = require("http");
-const { Server } = require("socket.io");
 const crypto = require("crypto");
+const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
-
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
   transports: ["websocket", "polling"]
 });
 
 const PORT = process.env.PORT || 10000;
 const rooms = new Map();
-const waitingPlayers = new Set();
+const waitingPlayers = new Map();
 const socketRoom = new Map();
 
-app.get("/", (_req, res) => {
-  res.json({
-    status: "ok",
-    game: "NeoWarriors",
-    multiplayer: true
-  });
-});
-
-app.get("/health", (_req, res) => {
-  res.json({
-    status: "ok",
-    game: "NeoWarriors"
-  });
-});
+app.get("/", (_req, res) => res.json({
+  status: "ok",
+  game: "NeoWarriors",
+  multiplayer: true
+}));
+app.get("/health", (_req, res) => res.json({
+  status: "ok",
+  game: "NeoWarriors"
+}));
 
 function makeCode() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
-
-  for (let i = 0; i < 6; i++) {
-    code += alphabet[crypto.randomInt(0, alphabet.length)];
-  }
-
+  for (let i = 0; i < 6; i++) code += chars[crypto.randomInt(0, chars.length)];
   return code;
 }
-
 function uniqueCode() {
   let code;
-
-  do {
-    code = makeCode();
-  } while (rooms.has(code));
-
+  do { code = makeCode(); } while (rooms.has(code));
   return code;
 }
-
 function safeName(value) {
-  return String(value || "Fighter")
-    .replace(/[<>]/g, "")
-    .trim()
-    .slice(0, 18) || "Fighter";
+  return String(value || "Fighter").replace(/[<>]/g, "").trim().slice(0, 18) || "Fighter";
 }
-
-function publicPlayers(room) {
-  return [...room.players.values()].map((player, index) => ({
-    id: player.id,
-    name: player.name,
-    slot: index + 1
+function playersList(room) {
+  return [...room.players.values()].map((p) => ({
+    id: p.id, name: p.name, uid: p.uid, role: p.role
   }));
 }
-
-function sendRoomError(socket, message) {
+function emitError(socket, message) {
   socket.emit("roomError", { message });
 }
-
-function removeFromQueue(socket) {
-  waitingPlayers.delete(socket.id);
+function clearWaiting(socketId) {
+  waitingPlayers.delete(socketId);
 }
-
-function detachSocket(socket, reason = "left") {
-  removeFromQueue(socket);
-
+function leaveRoom(socket, reason = "left") {
+  clearWaiting(socket.id);
   const code = socketRoom.get(socket.id);
-
   if (!code) return;
-
   socketRoom.delete(socket.id);
-
   const room = rooms.get(code);
-
   if (!room) return;
 
+  const departing = room.players.get(socket.id);
   room.players.delete(socket.id);
   socket.leave(code);
 
   socket.to(code).emit("playerLeft", {
     roomCode: code,
-    reason
+    reason,
+    name: departing ? departing.name : "Opponent"
   });
 
   if (room.players.size === 0) {
@@ -106,296 +75,218 @@ function detachSocket(socket, reason = "left") {
 
   room.status = "waiting";
   room.state = null;
-
-  room.players.forEach((player) => {
-    player.socket.emit("roomWaiting", {
+  for (const p of room.players.values()) {
+    p.socket.emit("roomWaiting", {
       roomCode: code,
-      players: publicPlayers(room),
+      role: p.role,
+      status: "waiting",
       message: "Opponent left. Waiting for another player."
     });
-  });
+  }
 }
-
-function joinSocketRoom(socket, room, name) {
-  room.players.set(socket.id, {
+function addPlayer(socket, room, payload, role) {
+  const p = {
     id: socket.id,
-    name: safeName(name),
-    socket
-  });
-
+    socket,
+    name: safeName(payload.name),
+    uid: String(payload.uid || "").slice(0, 128),
+    role
+  };
+  room.players.set(socket.id, p);
   socketRoom.set(socket.id, room.code);
   socket.join(room.code);
+  return p;
 }
-
-function startRoom(room) {
-  if (!room || room.players.size !== 2 || room.status === "matched") {
-    return;
-  }
-
+function readyRoom(room) {
+  if (!room || room.players.size !== 2 || room.status === "matched") return;
+  const host = [...room.players.values()].find(p => p.role === "host");
+  const guest = [...room.players.values()].find(p => p.role === "guest");
+  if (!host || !guest) return;
   room.status = "matched";
-
-  const players = publicPlayers(room);
-
-  room.players.forEach((player, index) => {
-    player.socket.emit("matchReady", {
-      roomCode: room.code,
-      players,
-      yourSlot: index + 1
-    });
+  const payloadFor = (p) => ({
+    roomCode: room.code,
+    role: p.role,
+    yourSlot: p.role === "host" ? 1 : 2,
+    hostName: host.name,
+    guestName: guest.name,
+    hostUid: host.uid,
+    guestUid: guest.uid,
+    players: playersList(room)
   });
+  host.socket.emit("matchReady", payloadFor(host));
+  guest.socket.emit("matchReady", payloadFor(guest));
+  console.log("Match ready:", room.code);
+}
+function createRoomFor(hostSocket, guestSocket, hostPayload, guestPayload) {
+  const code = uniqueCode();
+  const room = {
+    code,
+    status: "waiting",
+    players: new Map(),
+    state: null,
+    lastGuestInput: null,
+    createdAt: Date.now()
+  };
+  rooms.set(code, room);
+  addPlayer(hostSocket, room, hostPayload, "host");
+  if (guestSocket) addPlayer(guestSocket, room, guestPayload, "guest");
+  if (guestSocket) readyRoom(room);
+  else hostSocket.emit("roomWaiting", {
+    roomCode: code, role: "host", status: "waiting",
+    message: "Room ready. Share this code and wait for your opponent."
+  });
+  return room;
 }
 
 io.on("connection", (socket) => {
-  console.log("Player connected:", socket.id);
+  console.log("Connected:", socket.id);
+  socket.emit("serverReady", { status: "ok", socketId: socket.id });
 
-  socket.emit("serverReady", {
-    status: "ok",
-    socketId: socket.id
-  });
-
-  // CREATE PRIVATE ROOM
   socket.on("createRoom", (payload = {}) => {
-    detachSocket(socket, "changed-room");
-
-    const code = uniqueCode();
-
-    const room = {
-      code,
-      status: "waiting",
-      players: new Map(),
-      state: null,
-      createdAt: Date.now()
-    };
-
-    rooms.set(code, room);
-
-    joinSocketRoom(socket, room, payload.name);
-
-    socket.emit("roomCreated", {
-      roomCode: code,
-      players: publicPlayers(room),
-      status: "waiting"
-    });
-
-    console.log("Room created:", code);
+    leaveRoom(socket, "changed-room");
+    createRoomFor(socket, null, payload, null);
   });
 
-  // JOIN PRIVATE ROOM
   socket.on("joinRoom", (payload = {}) => {
-    const code = String(
-      payload.roomCode || payload.code || ""
-    ).trim().toUpperCase();
-
+    const code = String(payload.roomCode || payload.code || "").trim().toUpperCase();
     if (!/^[A-HJ-NP-Z2-9]{6}$/.test(code)) {
-      sendRoomError(
-        socket,
-        "Enter a valid 6-character room code."
-      );
+      emitError(socket, "Enter a valid 6-character room code.");
       return;
     }
-
     const room = rooms.get(code);
-
     if (!room) {
-      sendRoomError(
-        socket,
-        "Room not found. Check the code and try again."
-      );
+      emitError(socket, "Room not found. Check the code and try again.");
       return;
     }
-
-    if (room.players.has(socket.id)) {
-      socket.emit("roomJoined", {
-        roomCode: code,
-        players: publicPlayers(room),
-        status: room.status
-      });
-
-      if (room.players.size === 2) {
-        startRoom(room);
-      }
-
+    const uid = String(payload.uid || "");
+    const host = [...room.players.values()].find(p => p.role === "host");
+    if (host && uid && host.uid && host.uid === uid) {
+      emitError(socket, "Use another account or device to join your own room.");
       return;
     }
-
-    if (room.players.size >= 2 || room.status === "matched") {
-      sendRoomError(socket, "Room is full.");
+    if (room.status !== "waiting" || room.players.size >= 2) {
+      emitError(socket, "Room is full or the match has already started.");
       return;
     }
-
-    detachSocket(socket, "changed-room");
-
-    joinSocketRoom(socket, room, payload.name);
-
-    socket.emit("roomJoined", {
-      roomCode: code,
-      players: publicPlayers(room),
-      status: room.status
-    });
-
-    if (room.players.size === 2) {
-      startRoom(room);
-    } else {
-      socket.to(code).emit("playerJoined", {
-        roomCode: code,
-        players: publicPlayers(room)
-      });
-    }
-
-    console.log("Player joined room:", code);
+    leaveRoom(socket, "changed-room");
+    addPlayer(socket, room, payload, "guest");
+    readyRoom(room);
   });
 
-  // RANDOM MATCHMAKING
   socket.on("findMatch", (payload = {}) => {
-    detachSocket(socket, "matchmaking");
-
-    let target = null;
-
-    for (const id of waitingPlayers) {
-      if (id !== socket.id) {
-        const other = io.sockets.sockets.get(id);
-
-        if (
-          other &&
-          other.connected &&
-          !socketRoom.has(id)
-        ) {
-          target = other;
-          break;
-        }
+    leaveRoom(socket, "matchmaking");
+    let otherSocket = null;
+    let otherPayload = null;
+    for (const [id, queued] of waitingPlayers) {
+      if (id === socket.id) continue;
+      const candidate = io.sockets.sockets.get(id);
+      if (candidate && candidate.connected && !socketRoom.has(id)) {
+        otherSocket = candidate;
+        otherPayload = queued;
+        waitingPlayers.delete(id);
+        break;
       }
+      waitingPlayers.delete(id);
     }
-
-    if (target) {
-      removeFromQueue(target);
-
-      const code = uniqueCode();
-
-      const room = {
-        code,
-        status: "waiting",
-        players: new Map(),
-        state: null,
-        createdAt: Date.now()
-      };
-
-      rooms.set(code, room);
-
-      joinSocketRoom(
-        target,
-        room,
-        target.data.playerName || "Fighter"
-      );
-
-      joinSocketRoom(socket, room, payload.name);
-
-      startRoom(room);
-
-      console.log("Match found:", code);
+    if (otherSocket) {
+      createRoomFor(otherSocket, socket, otherPayload || {}, payload);
     } else {
-      socket.data.playerName = safeName(payload.name);
-      waitingPlayers.add(socket.id);
-
+      waitingPlayers.set(socket.id, {
+        name: safeName(payload.name),
+        uid: String(payload.uid || "").slice(0, 128)
+      });
       socket.emit("matchmakingWaiting", {
         message: "Searching for an opponent…"
       });
-
-      console.log("Searching for opponent:", socket.id);
     }
   });
 
-  // CANCEL MATCHMAKING
   socket.on("cancelMatchmaking", () => {
-    removeFromQueue(socket);
-
-    socket.emit("matchmakingCancelled", {
-      message: "Matchmaking cancelled."
-    });
+    clearWaiting(socket.id);
+    socket.emit("matchmakingCancelled", { message: "Matchmaking cancelled." });
   });
 
-  // SEND PLAYER CONTROLS TO OPPONENT
   socket.on("playerInput", (payload = {}) => {
     const code = socketRoom.get(socket.id);
     const room = code && rooms.get(code);
-
     if (!room || room.status !== "matched") return;
-
-    const input =
-      payload.input && typeof payload.input === "object"
-        ? payload.input
-        : {};
-
-    const clean = {};
-
-    for (const key of [
-      "l", "r", "j", "p", "k", "b", "s", "z", "d"
-    ]) {
-      clean[key] = !!input[key];
+    const player = room.players.get(socket.id);
+    if (!player || player.role !== "guest") return;
+    const raw = payload.input && typeof payload.input === "object" ? payload.input : {};
+    const input = {};
+    for (const key of ["l", "r", "j", "p", "k", "b", "s", "z", "d", "pingToken", "clientTs"]) {
+      if (key === "pingToken" || key === "clientTs") {
+        const n = Number(raw[key]);
+        input[key] = Number.isFinite(n) ? n : 0;
+      } else {
+        input[key] = !!raw[key];
+      }
     }
-
-    socket.to(code).emit("opponentInput", {
-      input: clean,
-      sentAt: Date.now()
-    });
+    room.lastGuestInput = input;
+    socket.to(code).emit("opponentInput", { input, sentAt: Date.now() });
   });
 
-  // SHARE GAME STATE
   socket.on("gameState", (payload = {}) => {
     const code = socketRoom.get(socket.id);
     const room = code && rooms.get(code);
-
     if (!room || room.status !== "matched") return;
-
-    // Slot 1 is the authoritative game-state sender.
     const player = room.players.get(socket.id);
-
-    if (
-      !player ||
-      [...room.players.keys()][0] !== socket.id
-    ) {
-      return;
-    }
-
+    if (!player || player.role !== "host") return;
     const state = payload.state;
-
     if (!state || typeof state !== "object") return;
-
+    if (room.lastGuestInput && room.lastGuestInput.pingToken) {
+      state.echoToken = room.lastGuestInput.pingToken;
+    }
     room.state = state;
-
-    socket.to(code).emit("gameState", {
-      state,
-      sentAt: Date.now()
-    });
+    socket.to(code).emit("gameState", { state, sentAt: Date.now() });
   });
 
-  // MATCH RESULT
   socket.on("matchResult", (payload = {}) => {
     const code = socketRoom.get(socket.id);
     const room = code && rooms.get(code);
-
-    if (!room) return;
-
+    if (!room || room.status !== "matched") return;
+    const player = room.players.get(socket.id);
+    if (!player || player.role !== "host") return;
+    const winnerRole = payload.winnerRole === "host" || payload.winnerRole === "guest"
+      ? payload.winnerRole : null;
+    room.status = "completed";
+    const host = [...room.players.values()].find(p => p.role === "host");
+    const guest = [...room.players.values()].find(p => p.role === "guest");
     io.to(code).emit("matchResult", {
-      winner: safeName(payload.winner),
-      score: String(payload.score || "").slice(0, 20),
+      roomCode: code,
+      winnerRole,
+      hostName: host ? host.name : "Host",
+      guestName: guest ? guest.name : "Guest",
       reason: String(payload.reason || "completed").slice(0, 40)
     });
   });
 
-  // LEAVE ROOM
-  socket.on("leaveRoom", () => {
-    detachSocket(socket, "left");
+  socket.on("forfeit", () => {
+    const code = socketRoom.get(socket.id);
+    const room = code && rooms.get(code);
+    if (!room || room.status !== "matched") return;
+    const player = room.players.get(socket.id);
+    if (!player) return;
+    room.status = "completed";
+    const winnerRole = player.role === "host" ? "guest" : "host";
+    const host = [...room.players.values()].find(p => p.role === "host");
+    const guest = [...room.players.values()].find(p => p.role === "guest");
+    io.to(code).emit("matchResult", {
+      roomCode: code,
+      winnerRole,
+      hostName: host ? host.name : "Host",
+      guestName: guest ? guest.name : "Guest",
+      reason: "forfeit"
+    });
   });
 
-  // PLAYER DISCONNECTED
+  socket.on("leaveRoom", () => leaveRoom(socket, "left"));
   socket.on("disconnect", () => {
-    console.log("Player disconnected:", socket.id);
-    detachSocket(socket, "disconnected");
+    console.log("Disconnected:", socket.id);
+    leaveRoom(socket, "disconnected");
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `NeoWarriors multiplayer server listening on ${PORT}`
-  );
+  console.log(`NeoWarriors multiplayer server listening on ${PORT}`);
 });
