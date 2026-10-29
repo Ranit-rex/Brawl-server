@@ -6,15 +6,20 @@ const { Server } = require("socket.io");
 const app = express();
 const server = http.createServer(app);
 
+const PORT = process.env.PORT || 10000;
+
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
   },
-  transports: ["websocket", "polling"]
+  transports: ["websocket", "polling"],
+  pingInterval: 10000,
+  pingTimeout: 20000,
+  connectTimeout: 20000,
+  maxHttpBufferSize: 1e6
 });
 
-const PORT = process.env.PORT || 10000;
 const rooms = new Map();
 const waitingPlayers = new Map();
 const socketRoom = new Map();
@@ -30,7 +35,7 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
-    game: "NeoWarriors"
+    uptime: Math.floor(process.uptime())
   });
 });
 
@@ -62,6 +67,19 @@ function safeName(value) {
     .slice(0, 18) || "Fighter";
 }
 
+function emitError(socket, message) {
+  socket.emit("roomError", { message });
+}
+
+function clearWaiting(socketId) {
+  waitingPlayers.delete(socketId);
+}
+
+function getRoom(socket) {
+  const code = socketRoom.get(socket.id);
+  return code ? rooms.get(code) : null;
+}
+
 function playersList(room) {
   return [...room.players.values()].map(p => ({
     id: p.id,
@@ -69,14 +87,6 @@ function playersList(room) {
     uid: p.uid,
     role: p.role
   }));
-}
-
-function emitError(socket, message) {
-  socket.emit("roomError", { message });
-}
-
-function clearWaiting(socketId) {
-  waitingPlayers.delete(socketId);
 }
 
 function leaveRoom(socket, reason = "left") {
@@ -108,6 +118,7 @@ function leaveRoom(socket, reason = "left") {
 
   room.status = "waiting";
   room.state = null;
+  room.lastGuestInput = null;
 
   for (const player of room.players.values()) {
     player.socket.emit("roomWaiting", {
@@ -136,9 +147,8 @@ function addPlayer(socket, room, payload, role) {
 }
 
 function readyRoom(room) {
-  if (!room || room.players.size !== 2 || room.status === "matched") {
-    return;
-  }
+  if (!room || room.players.size !== 2) return;
+  if (room.status === "matched") return;
 
   const host = [...room.players.values()]
     .find(p => p.role === "host");
@@ -150,7 +160,7 @@ function readyRoom(room) {
 
   room.status = "matched";
 
-  const payloadFor = player => ({
+  const makePayload = player => ({
     roomCode: room.code,
     role: player.role,
     yourSlot: player.role === "host" ? 1 : 2,
@@ -161,13 +171,13 @@ function readyRoom(room) {
     players: playersList(room)
   });
 
-  host.socket.emit("matchReady", payloadFor(host));
-  guest.socket.emit("matchReady", payloadFor(guest));
+  host.socket.emit("matchReady", makePayload(host));
+  guest.socket.emit("matchReady", makePayload(guest));
 
   console.log("Match ready:", room.code);
 }
 
-function createRoomFor(hostSocket, guestSocket, hostPayload, guestPayload) {
+function createRoomFor(hostSocket, guestSocket, hostData, guestData) {
   const code = uniqueCode();
 
   const room = {
@@ -181,17 +191,17 @@ function createRoomFor(hostSocket, guestSocket, hostPayload, guestPayload) {
 
   rooms.set(code, room);
 
-  addPlayer(hostSocket, room, hostPayload, "host");
+  addPlayer(hostSocket, room, hostData || {}, "host");
 
   if (guestSocket) {
-    addPlayer(guestSocket, room, guestPayload, "guest");
+    addPlayer(guestSocket, room, guestData || {}, "guest");
     readyRoom(room);
   } else {
     hostSocket.emit("roomWaiting", {
       roomCode: code,
       role: "host",
       status: "waiting",
-      message: "Room ready. Share this code and wait for your opponent."
+      message: "Room ready. Share this code with your opponent."
     });
   }
 
@@ -206,11 +216,14 @@ io.on("connection", socket => {
     socketId: socket.id
   });
 
+  // CREATE PRIVATE ROOM
   socket.on("createRoom", (payload = {}) => {
     leaveRoom(socket, "changed-room");
+
     createRoomFor(socket, null, payload, null);
   });
 
+  // JOIN PRIVATE ROOM
   socket.on("joinRoom", (payload = {}) => {
     const code = String(
       payload.roomCode || payload.code || ""
@@ -234,10 +247,7 @@ io.on("connection", socket => {
       .find(p => p.role === "host");
 
     if (host && uid && host.uid && host.uid === uid) {
-      emitError(
-        socket,
-        "Use another account or device to join your own room."
-      );
+      emitError(socket, "Use another account or device to join this room.");
       return;
     }
 
@@ -248,10 +258,23 @@ io.on("connection", socket => {
 
     leaveRoom(socket, "changed-room");
 
-    addPlayer(socket, room, payload, "guest");
-    readyRoom(room);
+    // Recheck after leaving any previous room.
+    const currentRoom = rooms.get(code);
+
+    if (
+      !currentRoom ||
+      currentRoom.status !== "waiting" ||
+      currentRoom.players.size >= 2
+    ) {
+      emitError(socket, "Room is no longer available. Try again.");
+      return;
+    }
+
+    addPlayer(socket, currentRoom, payload, "guest");
+    readyRoom(currentRoom);
   });
 
+  // RANDOM MATCHMAKING
   socket.on("findMatch", (payload = {}) => {
     leaveRoom(socket, "matchmaking");
 
@@ -296,6 +319,7 @@ io.on("connection", socket => {
     }
   });
 
+  // CANCEL SEARCH
   socket.on("cancelMatchmaking", () => {
     clearWaiting(socket.id);
 
@@ -304,9 +328,9 @@ io.on("connection", socket => {
     });
   });
 
-  // Ping measurement
+  // LOW-OVERHEAD PING CHECK
   socket.on("pingCheck", payload => {
-    const token = Number(payload?.token);
+    const token = Number(payload && payload.token);
 
     socket.emit("pingCheckResult", {
       token: Number.isFinite(token) ? token : 0,
@@ -314,10 +338,9 @@ io.on("connection", socket => {
     });
   });
 
-  // Guest sends controller inputs to host
+  // GUEST INPUTS -> HOST
   socket.on("playerInput", payload => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
+    const room = getRoom(socket);
 
     if (!room || room.status !== "matched") return;
 
@@ -326,37 +349,33 @@ io.on("connection", socket => {
     if (!player || player.role !== "guest") return;
 
     const raw =
-      payload.input && typeof payload.input === "object"
+      payload && payload.input && typeof payload.input === "object"
         ? payload.input
         : {};
 
     const input = {};
 
-    for (const key of [
-      "l", "r", "j", "p", "k",
-      "b", "s", "z", "d",
-      "pingToken", "clientTs"
-    ]) {
-      if (key === "pingToken" || key === "clientTs") {
-        const number = Number(raw[key]);
-        input[key] = Number.isFinite(number) ? number : 0;
-      } else {
-        input[key] = !!raw[key];
-      }
+    for (const key of ["l", "r", "j", "p", "k", "b", "s", "z", "d"]) {
+      input[key] = !!raw[key];
+    }
+
+    // Preserve optional timing data if the client sends it.
+    for (const key of ["pingToken", "clientTs"]) {
+      const n = Number(raw[key]);
+      if (Number.isFinite(n)) input[key] = n;
     }
 
     room.lastGuestInput = input;
 
-    socket.to(code).emit("opponentInput", {
+    socket.to(room.code).emit("opponentInput", {
       input,
       sentAt: Date.now()
     });
   });
 
-  // Host sends game state
+  // HOST GAME STATE -> GUEST
   socket.on("gameState", payload => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
+    const room = getRoom(socket);
 
     if (!room || room.status !== "matched") return;
 
@@ -364,26 +383,31 @@ io.on("connection", socket => {
 
     if (!player || player.role !== "host") return;
 
-    const state = payload.state;
+    const state = payload && payload.state;
 
     if (!state || typeof state !== "object") return;
 
-    if (room.lastGuestInput && room.lastGuestInput.pingToken) {
-      state.echoToken = room.lastGuestInput.pingToken;
+    // Do not mutate the client's original state object.
+    const safeState = { ...state };
+
+    if (
+      room.lastGuestInput &&
+      room.lastGuestInput.pingToken
+    ) {
+      safeState.echoToken = room.lastGuestInput.pingToken;
     }
 
-    room.state = state;
+    room.state = safeState;
 
-    socket.to(code).emit("gameState", {
-      state,
+    socket.to(room.code).emit("gameState", {
+      state: safeState,
       sentAt: Date.now()
     });
   });
 
-  // Match finished
+  // MATCH FINISHED
   socket.on("matchResult", payload => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
+    const room = getRoom(socket);
 
     if (!room || room.status !== "matched") return;
 
@@ -392,8 +416,10 @@ io.on("connection", socket => {
     if (!player || player.role !== "host") return;
 
     const winnerRole =
-      payload.winnerRole === "host" ||
-      payload.winnerRole === "guest"
+      payload && (
+        payload.winnerRole === "host" ||
+        payload.winnerRole === "guest"
+      )
         ? payload.winnerRole
         : null;
 
@@ -405,24 +431,24 @@ io.on("connection", socket => {
     const guest = [...room.players.values()]
       .find(p => p.role === "guest");
 
-    io.to(code).emit("matchResult", {
-      roomCode: code,
+    io.to(room.code).emit("matchResult", {
+      roomCode: room.code,
       winnerRole,
       hostName: host ? host.name : "Host",
       guestName: guest ? guest.name : "Guest",
-      reason: String(payload.reason || "completed").slice(0, 40)
+      reason: String(
+        (payload && payload.reason) || "completed"
+      ).slice(0, 40)
     });
   });
 
-  // Player exits or forfeits
+  // PLAYER FORFEITS
   socket.on("forfeit", () => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
+    const room = getRoom(socket);
 
     if (!room || room.status !== "matched") return;
 
     const player = room.players.get(socket.id);
-
     if (!player) return;
 
     room.status = "completed";
@@ -436,8 +462,8 @@ io.on("connection", socket => {
     const guest = [...room.players.values()]
       .find(p => p.role === "guest");
 
-    io.to(code).emit("matchResult", {
-      roomCode: code,
+    io.to(room.code).emit("matchResult", {
+      roomCode: room.code,
       winnerRole,
       hostName: host ? host.name : "Host",
       guestName: guest ? guest.name : "Guest",
@@ -445,16 +471,20 @@ io.on("connection", socket => {
     });
   });
 
+  // LEAVE ROOM
   socket.on("leaveRoom", () => {
     leaveRoom(socket, "left");
   });
 
-  socket.on("disconnect", () => {
-    console.log("Disconnected:", socket.id);
+  // DISCONNECT CLEANUP
+  socket.on("disconnect", reason => {
+    console.log("Disconnected:", socket.id, reason);
     leaveRoom(socket, "disconnected");
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`NeoWarriors multiplayer server listening on ${PORT}`);
+  console.log(
+    `NeoWarriors multiplayer server listening on ${PORT}`
+  );
 });
